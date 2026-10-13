@@ -4,7 +4,6 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.kinyo.sutoa.domain.model.AppItem
 import com.kinyo.sutoa.domain.repository.AppRepository
-import com.kinyo.sutoa.domain.repository.RepoResult
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -56,25 +55,9 @@ class SearchViewModel @Inject constructor(
 
     private fun searchNow(query: String) = viewModelScope.launch {
         _state.value = _state.value.copy(loading = true)
-        when (val result = repository.search(query)) {
-            is RepoResult.Success -> _state.value = _state.value.copy(
-                loading = false,
-                searched = true,
-                results = result.data,
-            )
-            is RepoResult.Stale -> {
-                _state.value = _state.value.copy(
-                    loading = false,
-                    searched = true,
-                    results = result.data,
-                )
-                _snackbar.send("Data offline, menampilkan cache")
-            }
-            RepoResult.NetworkError -> {
-                _state.value = _state.value.copy(loading = false, searched = true, results = emptyList())
-                _snackbar.send("Gagal memuat, cek koneksi")
-            }
-        }
+        val results = repository.search(query)
+        _state.value = _state.value.copy(loading = false, searched = true, results = results)
+        if (results.isEmpty()) _snackbar.send("Gagal memuat, cek koneksi")
     }
 
     companion object {

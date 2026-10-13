@@ -5,7 +5,6 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.kinyo.sutoa.domain.model.AppItem
 import com.kinyo.sutoa.domain.repository.AppRepository
-import com.kinyo.sutoa.domain.repository.RepoResult
 import com.kinyo.sutoa.util.ApkInstaller
 import com.kinyo.sutoa.util.PackageUtils
 import com.kinyo.sutoa.util.canRequestPackageInstalls
@@ -54,19 +53,12 @@ class DetailViewModel @Inject constructor(
     fun load(packageName: String) {
         viewModelScope.launch {
             _state.value = _state.value.copy(loading = true)
-            when (val result = repository.get(packageName)) {
-                is RepoResult.Success -> result.data?.let(::applyItem) ?: run {
-                    _state.value = _state.value.copy(loading = false, item = null)
-                    _snackbar.send("Aplikasi tidak ditemukan di source manapun")
-                }
-                is RepoResult.Stale -> {
-                    applyItem(result.data)
-                    _snackbar.send("Data offline, menampilkan cache")
-                }
-                RepoResult.NetworkError -> {
-                    _state.value = _state.value.copy(loading = false, item = null)
-                    _snackbar.send("Gagal memuat, cek koneksi")
-                }
+            val item = repository.get(packageName)
+            if (item != null) {
+                applyItem(item)
+            } else {
+                _state.value = _state.value.copy(loading = false, item = null)
+                _snackbar.send("Gagal memuat, cek koneksi")
             }
         }
     }
@@ -74,16 +66,12 @@ class DetailViewModel @Inject constructor(
     fun refresh(packageName: String) {
         viewModelScope.launch {
             _state.value = _state.value.copy(loading = true)
-            when (val result = repository.refresh(packageName)) {
-                is RepoResult.Success -> result.data?.let(::applyItem) ?: run {
-                    _state.value = _state.value.copy(loading = false, item = null)
-                    _snackbar.send("Aplikasi tidak ditemukan di source manapun")
-                }
-                is RepoResult.Stale -> applyItem(result.data)
-                RepoResult.NetworkError -> {
-                    _state.value = _state.value.copy(loading = false)
-                    _snackbar.send("Gagal memuat, cek koneksi")
-                }
+            val item = repository.refresh(packageName)
+            if (item != null) {
+                applyItem(item)
+            } else {
+                _state.value = _state.value.copy(loading = false, item = null)
+                _snackbar.send("Aplikasi tidak ditemukan di source manapun")
             }
         }
     }
@@ -117,9 +105,15 @@ class DetailViewModel @Inject constructor(
                 }
             }
             _state.value = _state.value.copy(progress = null)
-            // Launcher-free delivery: expose the FileProvider ACTION_VIEW intent
-            // (FLAG_GRANT_READ_URI_PERMISSION added inside installIntent()).
-            _launch.send(installer.installIntent(file))
+            // Verified file only ever reaches the system installer here:
+            // ApkInstaller.install() checks canRequestPackageInstalls(), routes
+            // to unknown-sources settings when needed, otherwise fires the
+            // FileProvider ACTION_VIEW intent with FLAG_GRANT_READ_URI_PERMISSION.
+            val launched = installer.install(file)
+            if (!launched) {
+                _state.value = _state.value.copy(needsInstallPermission = true)
+                _snackbar.send("Izinkan instalasi aplikasi unknown terlebih dahulu")
+            }
             _state.value = _state.value.copy(action = actionFor(item))
         } catch (t: Throwable) {
             _state.value = _state.value.copy(progress = null, action = actionFor(item))

@@ -10,7 +10,6 @@ import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
-import dagger.multibindings.IntoSet
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import okhttp3.OkHttpClient
@@ -21,7 +20,7 @@ import java.util.concurrent.TimeUnit
 import javax.inject.Singleton
 
 /**
- * Core DI module. New source plugins are registered with `@Provides @IntoSet`
+ * Core DI module. New source plugins are registered in the ordered `provideAppSources` set
  * returning [com.kinyo.sutoa.data.source.AppSource] — nothing else changes.
  */
 @Module
@@ -78,21 +77,26 @@ object AppModule {
     @DefaultDispatcher
     fun provideDefaultDispatcher(): CoroutineDispatcher = Dispatchers.Default
 
-    // ─── Source plugins (multibinding set) ───────────────────────────────────
+    // ─── Source plugins (ordered set — dedup priority fdroid > github) ──────
+    //
+    // The Set is provided in PRIORITY ORDER (LinkedHashSet preserves iteration
+    // order; Hilt caches it as a Singleton). AppRepository flattens results in
+    // this order and dedupes with distinctBy{packageName}, so an fdroid entry
+    // always beats a github entry for the same package.
+    //
+    // To add a new source (GitLab, Codeberg, custom repo): implement AppSource,
+    // then append it here at the desired priority position. No UI/ViewModel/
+    // Repository changes required.
 
     @Provides
-    @IntoSet
-    fun provideFdroidSource(@FdroidApiQualifier api: FdroidApi): com.kinyo.sutoa.data.source.AppSource =
-        FdroidSource(api)
+    @Singleton
+    fun provideAppSources(
+        @FdroidApiQualifier fdroidApi: FdroidApi,
+        @GithubApiQualifier gitHubApi: GitHubApi,
+        gitHubCatalog: com.kinyo.sutoa.data.source.GitHubCatalog,
+    ): Set<com.kinyo.sutoa.data.source.AppSource> = linkedSetOf<com.kinyo.sutoa.data.source.AppSource>(
+        FdroidSource(fdroidApi),   // priority 1st — wins dedup
+        GitHubSource(gitHubApi, gitHubCatalog), // priority 2nd
+    )
 
-    @Provides
-    @IntoSet
-    fun provideGitHubSource(
-        @GithubApiQualifier api: GitHubApi,
-        catalog: com.kinyo.sutoa.data.source.GitHubCatalog,
-    ): com.kinyo.sutoa.data.source.AppSource = GitHubSource(api, catalog)
-
-    // Example of how a future plugin would be added — no UI/VM/repo changes:
-    // @Provides @IntoSet
-    // fun provideGitLabSource(api: GitLabApi): AppSource = GitLabSource(api)
 }

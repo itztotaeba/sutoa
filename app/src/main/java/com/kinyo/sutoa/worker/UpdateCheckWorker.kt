@@ -23,7 +23,6 @@ import com.kinyo.sutoa.R
 import com.kinyo.sutoa.data.cache.AppCacheDao
 import com.kinyo.sutoa.data.cache.toAppItem
 import com.kinyo.sutoa.domain.repository.AppRepository
-import com.kinyo.sutoa.domain.repository.RepoResult
 import com.kinyo.sutoa.util.PackageUtils
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
@@ -46,10 +45,8 @@ class UpdateCheckWorker @AssistedInject constructor(
 
     override suspend fun doWork(): Result {
         // Refresh remote catalog into cache; tolerate offline (use whatever is cached).
-        when (repository.featured()) {
-            is RepoResult.NetworkError -> if (dao.getAll().isEmpty()) return Result.retry()
-            else -> Unit
-        }
+        val remoteCount = repository.featured().size
+        if (remoteCount == 0 && dao.getAll().isEmpty()) return Result.retry()
 
         val updates = dao.getAll()
             .map { it.toAppItem() }

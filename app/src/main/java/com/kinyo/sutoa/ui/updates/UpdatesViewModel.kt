@@ -5,7 +5,6 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.kinyo.sutoa.domain.model.AppItem
 import com.kinyo.sutoa.domain.repository.AppRepository
-import com.kinyo.sutoa.domain.repository.RepoResult
 import com.kinyo.sutoa.util.PackageUtils
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.channels.Channel
@@ -53,10 +52,7 @@ class UpdatesViewModel @Inject constructor(
     fun checkNow() {
         viewModelScope.launch {
             _state.value = _state.value.copy(loading = true)
-            when (repository.featured()) {
-                is RepoResult.NetworkError -> _snackbar.send("Gagal memuat, cek koneksi")
-                else -> Unit
-            }
+            if (repository.featured().isEmpty()) _snackbar.send("Gagal memuat, cek koneksi")
             // Refresh every app we know about individually too (best effort).
             repository.cachedApps().forEach { item ->
                 runCatching { repository.refresh(item.packageName) }

@@ -22,8 +22,6 @@ class GitHubSource @Inject constructor(
 ) : AppSource {
 
     override val id: String = SOURCE_ID
-    override val priority: Int = 1 // fdroid wins dedup
-
     private val authHeader: String? =
         BuildConfig.GITHUB_TOKEN.takeIf { it.isNotBlank() }?.let { "Bearer $it" }
 
