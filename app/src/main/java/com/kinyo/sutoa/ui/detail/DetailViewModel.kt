@@ -55,7 +55,10 @@ class DetailViewModel @Inject constructor(
         viewModelScope.launch {
             _state.value = _state.value.copy(loading = true)
             when (val result = repository.get(packageName)) {
-                is RepoResult.Success -> applyItem(result.data)
+                is RepoResult.Success -> result.data?.let(::applyItem) ?: run {
+                    _state.value = _state.value.copy(loading = false, item = null)
+                    _snackbar.send("Aplikasi tidak ditemukan di source manapun")
+                }
                 is RepoResult.Stale -> {
                     applyItem(result.data)
                     _snackbar.send("Data offline, menampilkan cache")
@@ -72,7 +75,10 @@ class DetailViewModel @Inject constructor(
         viewModelScope.launch {
             _state.value = _state.value.copy(loading = true)
             when (val result = repository.refresh(packageName)) {
-                is RepoResult.Success -> applyItem(result.data)
+                is RepoResult.Success -> result.data?.let(::applyItem) ?: run {
+                    _state.value = _state.value.copy(loading = false, item = null)
+                    _snackbar.send("Aplikasi tidak ditemukan di source manapun")
+                }
                 is RepoResult.Stale -> applyItem(result.data)
                 RepoResult.NetworkError -> {
                     _state.value = _state.value.copy(loading = false)
@@ -111,6 +117,8 @@ class DetailViewModel @Inject constructor(
                 }
             }
             _state.value = _state.value.copy(progress = null)
+            // Launcher-free delivery: expose the FileProvider ACTION_VIEW intent
+            // (FLAG_GRANT_READ_URI_PERMISSION added inside installIntent()).
             _launch.send(installer.installIntent(file))
             _state.value = _state.value.copy(action = actionFor(item))
         } catch (t: Throwable) {
