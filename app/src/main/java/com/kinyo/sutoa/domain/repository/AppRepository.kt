@@ -2,6 +2,7 @@ package com.kinyo.sutoa.domain.repository
 
 import android.util.Log
 import com.kinyo.sutoa.data.cache.AppCacheDao
+import com.kinyo.sutoa.data.cache.AppEntity
 import com.kinyo.sutoa.data.cache.toAppItem
 import com.kinyo.sutoa.data.cache.toEntity
 import com.kinyo.sutoa.data.source.AppSource
@@ -10,168 +11,227 @@ import com.kinyo.sutoa.domain.model.AppItem
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import javax.inject.Singleton
 
-/** Result wrapper so the UI can distinguish success / partial / network failure. */
-sealed interface RepoResult<out T> {
-    data class Success<T>(val data: T, val fromCache: Boolean = false) : RepoResult<T>
-    /** Remote failed but we could serve stale cache instead. */
-    data class Stale<T>(val data: T) : RepoResult<T>
-    data object NetworkError : RepoResult<Nothing>
-}
-
 /**
- * Aggregates every registered [AppSource] plugin into one catalog:
- *  - runs all sources in parallel
- *  - dedups by packageName (fdroid > github via [AppSource.priority])
- *  - cache-first via Room (fresh window = 24h)
+ * Unified entry point between the UI layer (ViewModels) and the plugin-based
+ * data layer ([AppSource] implementations + Room cache).
+ *
+ * Contract:
+ *  - every public function is `suspend`;
+ *  - all registered sources are queried **in parallel** with
+ *    `coroutineScope { sources.map { async { ... } }.awaitAll().flatten() }`;
+ *  - every `async` block is wrapped in `runCatching`, so one broken plugin can
+ *    never sink the others — it contributes an empty list and the error is
+ *    logged via Log.e(TAG, "Source <id> failed", e);
+ *  - merged results are deduped with `distinctBy { it.packageName }` AFTER
+ *    `flatten()`. Priority fdroid > github is guaranteed because the injected
+ *    Set<AppSource> is provided (di/AppModule.kt) in priority order and
+ *    distinctBy keeps the FIRST occurrence per package;
+ *  - cache-first strategy backed by Room: fresh (< 24 h) cache short-circuits
+ *    the network; stale/missing cache triggers a remote fetch that refreshes
+ *    the cache; on total network failure whatever is in cache is served
+ *    instead (with a warning log) so the app degrades gracefully offline.
+ *
+ * Adding a new source (GitLab, Codeberg, custom repo) only requires a new
+ * [AppSource] implementation and adding it to the ordered set provided in
+ * di/AppModule.kt —
+ * this repository, the ViewModels and the UI stay untouched.
  */
 @Singleton
 class AppRepository @Inject constructor(
+    /** Injected ordered set of plugins: fdroid first, then github (see AppModule). */
     private val sources: Set<@JvmSuppressWildcards AppSource>,
     private val dao: AppCacheDao,
     @IoDispatcher private val io: CoroutineDispatcher,
 ) {
 
-    private val orderedSources: List<AppSource> = sources.sortedBy { it.priority }
+    // ─── public API ────────────────────────────────────────────────────────────
 
-    /** Featured apps for Home. Cache-first with 24h TTL. */
-    suspend fun featured(): RepoResult<List<AppItem>> = withContext(io) {
-        val freshCutoff = System.currentTimeMillis() - TTL_MS
-        if (dao.hasFreshData(freshCutoff)) {
-            val cached = dao.getAll().map { it.toAppItem() }
-            if (cached.isNotEmpty()) return@withContext RepoResult.Success(cached, fromCache = true)
+    /**
+     * Featured apps for the Home screen.
+     * Cache-first: when the catalog cache is younger than TTL_MS we return it
+     * without touching the network. Otherwise every source is fetched in
+     * parallel, merged, deduped, persisted to Room and returned. If ALL remote
+     * sources fail we fall back to the (stale) cache rather than erroring out.
+     */
+    suspend fun featured(): List<AppItem> = withContext(io) {
+        val cached = readCache { dao.getAll() }
+
+        if (cached.isNotEmpty() && isCacheFresh()) {
+            Log.d(TAG, "featured: serving fresh cache (${cached.size} items)")
+            return@withContext cached
         }
 
-        val remote = fetchFromSources { it.featured() }
-        when {
-            remote.anySucceeded && remote.items.isNotEmpty() -> {
-                dao.insertAll(remote.items.map { it.toEntity() })
-                RepoResult.Success(remote.items)
+        val remote = fetchParallel { source -> source.featured() }
+
+        if (remote.isEmpty()) {
+            // Network error / no source produced anything -> serve cache + warn.
+            if (cached.isNotEmpty()) {
+                Log.w(TAG, "featured: all sources failed, serving cached data")
+                return@withContext cached
             }
-            remote.items.isNotEmpty() -> RepoResult.Stale(remote.items) // old cache rows
-            remote.anySucceeded -> RepoResult.Success(emptyList())
-            else -> RepoResult.NetworkError
+            Log.e(TAG, "featured: no remote data and empty cache")
+            return@withContext emptyList()
         }
+
+        val merged = dedupe(remote)
+        writeCache { dao.insertAll(merged.map { it.toEntity() }) }
+        merged
     }
 
-    /** Search across all sources + local cache; merged & deduped. */
-    suspend fun search(query: String, page: Int = 0): RepoResult<List<AppItem>> = withContext(io) {
-        if (query.isBlank()) return@withContext RepoResult.Success(emptyList())
+    /**
+     * Search across the local cache AND every remote source, merged & deduped.
+     * Local matches are always included (offline-friendly); successful remote
+     * results refresh the cache. On total network failure the cached matches
+     * are returned instead of throwing.
+     */
+    suspend fun search(query: String, page: Int = 0): List<AppItem> = withContext(io) {
+        val q = query.trim()
+        if (q.isEmpty()) return@withContext emptyList()
 
-        val local = runCatching { dao.search(query).map { it.toAppItem() } }.getOrDefault(emptyList())
-        val remote = fetchFromSources { it.search(query, page) }
+        val local = readCache { dao.search(q) }
+        val remote = fetchParallel { source -> source.search(q, page) }
 
-        val merged = dedupe(local + remote.items)
-        if (remote.anySucceeded && remote.items.isNotEmpty()) {
-            dao.insertAll(remote.items.map { it.toEntity() })
+        if (remote.isEmpty() && local.isEmpty()) {
+            Log.w(TAG, "search(\"$q\"): nothing from network or cache")
+            return@withContext emptyList()
         }
+        if (remote.isEmpty()) {
+            Log.w(TAG, "search(\"$q\"): all sources failed, serving cache only")
+            return@withContext dedupe(local)
+        }
+
+        val merged = dedupe(local + remote)
+        writeCache { dao.insertAll(remote.map { it.toEntity() }) }
+        merged
+    }
+
+    /**
+     * Single-app detail lookup by package name. Cache-first with a 24 h
+     * freshness window keyed per package; on miss/stale, every source is asked
+     * in parallel and the highest-priority hit (fdroid > github) is cached and
+     * returned. Falls back to the stale cache entry when the whole network
+     * layer fails. Returns null only when genuinely unknown everywhere.
+     */
+    suspend fun get(packageName: String): AppItem? = withContext(io) {
+        val cachedEntity = runCatching { dao.getByPkg(packageName) }
+            .onFailure { Log.w(TAG, "cache read failed for $packageName", it) }
+            .getOrNull()
+        val cached = cachedEntity?.toAppItem()
+        val isFresh = cachedEntity != null &&
+            (System.currentTimeMillis() - cachedEntity.cachedAt) < TTL_MS
+
+        if (isFresh && cached != null) {
+            Log.d(TAG, "get($packageName): serving fresh cache")
+            return@withContext cached
+        }
+
+        val remote = fetchParallel { source -> listOfNotNull(source.get(packageName)) }
+        val hit = dedupe(remote).firstOrNull()
 
         when {
-            merged.isNotEmpty() -> RepoResult.Success(merged)
-            remote.anySucceeded -> RepoResult.Success(emptyList())
-            else -> RepoResult.NetworkError
-        }
-    }
-
-    /** Detail lookup: cache first, then ask each source in priority order. */
-    suspend fun get(packageName: String): RepoResult<AppItem> = withContext(io) {
-        val cached = dao.getByPkg(packageName)?.toAppItem()
-        val isFresh = cached != null &&
-            (System.currentTimeMillis() - (dao.getByPkg(packageName)?.cachedAt ?: 0L)) < TTL_MS
-
-        if (isFresh && cached != null) return@withContext RepoResult.Success(cached, fromCache = true)
-
-        var anySucceeded = false
-        for (source in orderedSources) {
-            val item = try {
-                source.get(packageName)
-            } catch (t: Throwable) {
-                Log.w(TAG, "source ${source.id} get($packageName) threw", t)
+            hit != null -> {
+                writeCache { dao.insert(hit.toEntity()) }
+                hit
+            }
+            // No source returned the package -> serve stale cache rather than null.
+            cached != null -> {
+                Log.w(TAG, "get($packageName): sources returned nothing, serving stale cache")
+                cached
+            }
+            else -> {
+                Log.d(TAG, "get($packageName): not found in any source or cache")
                 null
             }
-            if (item != null) {
-                anySucceeded = true
-                dao.insert(item.toEntity())
-                return@withContext RepoResult.Success(item)
-            }
-        }
-
-        // No source returned data. Fall back to cache even if stale.
-        return@withContext when {
-            cached != null -> RepoResult.Stale(cached)
-            anySucceeded -> RepoResult.NetworkError // shouldn't happen, defensive
-            else -> RepoResult.NetworkError
         }
     }
 
-    /** All cached apps — used by Updates screen as the known-catalog set. */
+    /**
+     * Like [featured] but ignores cache freshness — always does a full parallel
+     * remote pass. Falls back to stale cache when every source fails.
+     */
+    suspend fun refreshFeatured(): List<AppItem> = withContext(io) {
+        val remote = fetchParallel { source -> source.featured() }
+        if (remote.isEmpty()) {
+            Log.w(TAG, "refreshFeatured: all sources failed, serving cached data")
+            readCache { dao.getAll() }
+        } else {
+            val merged = dedupe(remote)
+            writeCache { dao.insertAll(merged.map { it.toEntity() }) }
+            merged
+        }
+    }
+
+    /** All cached apps — used by the Updates screen / worker as the known-catalog set. */
     suspend fun cachedApps(): List<AppItem> = withContext(io) {
-        dao.getAll().map { it.toAppItem() }
+        readCache { dao.getAll() }
     }
 
-    /** Force refresh of a single package (e.g. user pull-to-refresh on detail). */
-    suspend fun refresh(packageName: String): RepoResult<AppItem> = withContext(io) {
-        var anySucceeded = false
-        for (source in orderedSources) {
-            val item = runCatching { source.get(packageName) }.getOrNull()
-            if (item != null) {
-                anySucceeded = true
-                dao.insert(item.toEntity())
-                return@withContext RepoResult.Success(item)
-            }
-        }
-        val cached = dao.getByPkg(packageName)?.toAppItem()
-        when {
-            cached != null -> RepoResult.Stale(cached)
-            anySucceeded -> RepoResult.NetworkError
-            else -> RepoResult.NetworkError
+    /** Force-refresh one package (e.g. user pulled-to-refresh on Detail screen). */
+    suspend fun refresh(packageName: String): AppItem? = withContext(io) {
+        val remote = fetchParallel { source -> listOfNotNull(source.get(packageName)) }
+        val hit = dedupe(remote).firstOrNull()
+        if (hit != null) {
+            writeCache { dao.insert(hit.toEntity()) }
+            hit
+        } else {
+            Log.w(TAG, "refresh($packageName): network returned nothing, keeping cache")
+            runCatching { dao.getByPkg(packageName)?.toAppItem() }.getOrNull()
         }
     }
 
-    // ─── internals ────────────────────────────────────────────────────────────
+    // ─── internals ─────────────────────────────────────────────────────────────
 
-    private class RemoteOutcome(val items: List<AppItem>, val anySucceeded: Boolean)
-
-    /** Run [block] on every source in parallel; failures are swallowed per-source. */
-    private suspend fun fetchFromSources(block: suspend (AppSource) -> List<AppItem>): RemoteOutcome =
-        coroutineScopeSafe {
-            val results = orderedSources.map { source ->
+    /**
+     * Runs [block] against every registered source IN PARALLEL using
+     * coroutineScope + async. Each call is isolated with runCatching: a failing
+     * source logs its error and contributes an empty list while the remaining
+     * sources keep working.
+     */
+    private suspend fun fetchParallel(
+        block: suspend (AppSource) -> List<AppItem>,
+    ): List<AppItem> = coroutineScope {
+        sources
+            .map { source ->
                 async {
                     runCatching { block(source) }
-                        .onFailure { Log.w(TAG, "source ${source.id} failed", it) }
-                        .getOrDefault(null) to (runCatching { true }.isSuccess)
+                        .onFailure { e -> Log.e(TAG, "Source ${source.id} failed", e) }
+                        .getOrDefault(emptyList())
                 }
-            }.awaitAll()
-
-            val flat = results.flatMap { it.first.orEmpty() }
-            val succeeded = results.any { it.first != null }
-            RemoteOutcome(dedupe(flat), succeeded)
-        }
-
-    private suspend fun coroutineScopeSafe(
-        block: suspend kotlinx.coroutines.CoroutineScope.() -> RemoteOutcome,
-    ): RemoteOutcome = kotlinx.coroutines.coroutineScope { block() }
-
-    /** Dedup by packageName keeping the entry from the lowest-priority-number source. */
-    private fun dedupe(items: List<AppItem>): List<AppItem> {
-        val best = LinkedHashMap<String, AppItem>()
-        val prio = orderedSources.associate { it.id to it.priority }
-        for (item in items) {
-            val existing = best[item.packageName]
-            if (existing == null ||
-                (prio[item.source] ?: Int.MAX_VALUE) < (prio[existing.source] ?: Int.MAX_VALUE)
-            ) {
-                best[item.packageName] = item
             }
-        }
-        return best.values.toList()
+            .awaitAll()
+            .flatten()
+    }
+
+    /**
+     * Dedup by packageName keeping the FIRST occurrence. Because di/AppModule
+     * provides the Set<AppSource> in priority order (fdroid before github), the
+     * flatten() output already carries fdroid entries first — so fdroid wins.
+     */
+    private fun dedupe(items: List<AppItem>): List<AppItem> =
+        items.distinctBy { it.packageName }
+
+    private suspend fun isCacheFresh(): Boolean =
+        runCatching { dao.hasFreshData(System.currentTimeMillis() - TTL_MS) }
+            .getOrDefault(false)
+
+    private inline fun readCache(
+        crossinline query: suspend () -> List<AppEntity>,
+    ): List<AppItem> = runCatching { query().map { it.toAppItem() } }
+        .onFailure { Log.w(TAG, "cache read failed", it) }
+        .getOrDefault(emptyList())
+
+    private inline fun writeCache(crossinline block: suspend () -> Unit) {
+        runCatching { block() }.onFailure { Log.w(TAG, "cache write failed", it) }
     }
 
     companion object {
-        const val TTL_MS = 24L * 60L * 60L * 1000L // 24 hours
+        /** Cache freshness window: 24 hours. */
+        const val TTL_MS = 24L * 60L * 60L * 1000L
         private const val TAG = "AppRepository"
     }
 }

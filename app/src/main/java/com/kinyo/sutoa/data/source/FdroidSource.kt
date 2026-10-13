@@ -17,8 +17,6 @@ class FdroidSource @Inject constructor(
 ) : AppSource {
 
     override val id: String = SOURCE_ID
-    override val priority: Int = 0 // fdroid wins dedup over github
-
     override suspend fun search(query: String, page: Int): List<AppItem> {
         if (query.isBlank()) return emptyList()
         return runCatching { api.search(query.trim(), page).packages.map(::toAppItem) }

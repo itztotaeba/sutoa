@@ -59,22 +59,32 @@ class ApkDownloader @Inject constructor(
                 ?: body.contentLength().takeIf { it > 0 } ?: -1L
 
             val tmp = File(dest.parentFile, dest.name + ".part")
-            tmp.outputStream().use { out ->
-                body.byteStream().use { input ->
-                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                    var done = 0L
-                    while (true) {
-                        coroutineContext.ensureActive()
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        out.write(buffer, 0, read)
-                        done += read
-                        onProgress(if (total > 0) (done.toFloat() / total).coerceIn(0f, 1f) else -1f)
+            try {
+                tmp.outputStream().use { out ->
+                    body.byteStream().use { input ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        var done = 0L
+                        while (true) {
+                            coroutineContext.ensureActive()
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            out.write(buffer, 0, read)
+                            done += read
+                            onProgress(if (total > 0) (done.toFloat() / total).coerceIn(0f, 1f) else -1f)
+                        }
+                        out.flush()
                     }
-                    out.flush()
                 }
+            } catch (t: Throwable) {
+                // Cleanup: never leave a partial/corrupt file behind.
+                if (!tmp.delete()) Log.w(TAG, "failed to delete partial download ${tmp.name}")
+                if (dest.exists() && dest.length() == 0L) dest.delete()
+                throw t
             }
-            if (!tmp.renameTo(dest)) throw IOException("Failed to move temp file into place")
+            if (!tmp.renameTo(dest)) {
+                tmp.delete()
+                throw IOException("Failed to move temp file into place")
+            }
             dest
         }
     }
