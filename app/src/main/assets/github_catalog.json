@@ -1,0 +1,20 @@
+[
+  {
+    "owner": "F-Droid",
+    "repo": "fdroidclient",
+    "packageName": "org.fdroid.fdroid",
+    "featured": true
+  },
+  {
+    "owner": "billthefarmer",
+    "repo": "editor",
+    "packageName": "org.billthefarmer.editor",
+    "featured": true
+  },
+  {
+    "owner": "torvalds",
+    "repo": "linux",
+    "packageName": "com.example.notanapp",
+    "featured": false
+  }
+]

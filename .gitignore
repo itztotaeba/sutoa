@@ -1,0 +1,5 @@
+.gradle/
+build/
+target/
+gradle-8.7/
+gradle-*.zip
